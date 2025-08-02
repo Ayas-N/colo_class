@@ -5,8 +5,8 @@
 
 # Installation
 - Clone the repository:
-```git clone https://github.com/Ayas-N/colo_class.git
-cd colo_class```
+```git clone https://github.com/Ayas-N/colo_class.git```
+```cd colo_class```
 
 - Install Pytorch and other dependencies. For Conda users, create a new conda environment using:
 
@@ -15,5 +15,6 @@ cd colo_class```
 and then activate using
 
 ```conda activate downstream```
+
 
 
