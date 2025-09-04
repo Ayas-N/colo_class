@@ -97,7 +97,7 @@ def parse_args():
                         help='Batch Size')
     parser.add_argument('--num_workers', type=int, default=4, nargs = '?', const = True,
                         help='Batch Size')
-    parser.add_argument('--gpu_id', type=int, default=1, nargs = '?', const = True,
+    parser.add_argument('--gpu_id', type=int, default=0, nargs = '?', const = True,
                     help='Batch Size')
     parser.add_argument('--pretrained', type=str, default=False, nargs='?', const=True,
                     help='Use ImageNet-pretrained ResNet-18 (adds ImageNet mean/std)')
@@ -196,16 +196,18 @@ def main(val_ratio = 0.2):
         local_rank = 0
 
     train_dir = f"../datasets/{args.dataroot}/"
-    full_dataset = datasets.ImageFolder(train_dir, loader=pil_loader_tif)
+    full_dataset = datasets.ImageFolder(train_dir, loader=pil_loader_tif, transform = train_transform)
     val_size = int(len(full_dataset) * val_ratio)
-    train_size = len(full_dataset) - val_size
-
     # Split dataset
-    train_subset, val_subset = random_split(full_dataset, [train_size, val_size])
+    train_subset = full_dataset
+    # Experiment: Use train images as training, val is test
+    test_dir = f"../datasets/test_png/"
+    test_set = datasets.ImageFolder(test_dir, loader = pil_loader_tif, transform = test_transform)
+
     train_sampler = DistributedSampler(train_subset, shuffle=True) if args.dist else None
-    val_sampler   = DistributedSampler(val_subset,   shuffle=False) if args.dist else None
-    train_subset.dataset.transform = train_transform
-    val_subset.dataset.transform = test_transform
+    # val_sampler   = DistributedSampler(val_subset,   shuffle=False) if args.dist else None
+    test_sampler = DistributedSampler(test_set, shuffle = False) if args.dist else None
+
     trainloader = DataLoader(dataset = train_subset,
                         batch_size = args.batch_size,
                         num_workers = args.num_workers,
@@ -214,15 +216,15 @@ def main(val_ratio = 0.2):
                         pin_memory = True,
                         pin_memory_device=f"cuda:{local_rank}",
                         persistent_workers = True,
-                        prefetch_factor = 4
+                        prefetch_factor = 4,
                         )
-    weights = torchvision.models.ResNet18_Weights.DEFAULT   
+
     testloader = DataLoader(
-    dataset= val_subset, batch_size=args.batch_size,
+    dataset= test_set, batch_size=args.batch_size,
     num_workers=args.num_workers, pin_memory=True, shuffle=False,
-    persistent_workers=True, sampler = val_sampler,
+    persistent_workers=True, sampler = test_sampler,
     pin_memory_device=f"cuda:{local_rank}",
-    prefetch_factor=4
+    prefetch_factor=4,
     )
     num_classes = len(full_dataset.classes)
     if args.pretrained:
@@ -246,8 +248,13 @@ def main(val_ratio = 0.2):
         weight_decay=1e-4,
         fused = True
     )
-
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 2, gamma = 0.8)
+    min_learning_rate = 5.0e-6
+    # scheduler = optim.lr_scheduler.StepLR(optimizer, step_size = 4, gamma = 0.8)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer=optimizer,
+        T_max=10,
+        eta_min=min_learning_rate,
+     )
     criterion = nn.CrossEntropyLoss()
     if args.wandb and is_main_process():
         wandb.init(
@@ -266,7 +273,9 @@ def main(val_ratio = 0.2):
             }
         )
     # If model may be wrapped by DDP later, pass the underlying module if wrapped.
+    # Watch ONLY when a run exists
     _model_for_watch = model.module if hasattr(model, "module") else model
+    wandb.watch(_model_for_watch, log="gradients", log_freq=100)
     try:
         wandb.watch(_model_for_watch, log="gradients", log_freq=100)  # optional; can be "all" or "parameters"
     except Exception:
@@ -412,7 +421,7 @@ def main(val_ratio = 0.2):
                     'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                     'loss': train_loss_sync,
                 }
-                torch.save(checkpoint, f'checkpoints/{args.dataroot}_e{epoch+1}_{args.norm}_{"pt" if args.pretrained else ""}.pth')
+                torch.save(checkpoint, f'checkpoints/{args.dataroot}_e{epoch+1}_{args.norm}_{("pt" if args.pretrained else "")}.pth')
             else:
                 bad_epochs += 1
                 if bad_epochs >= patience:
@@ -427,8 +436,8 @@ def main(val_ratio = 0.2):
             if is_dist(): dist.barrier()
             break
             
-        if args.wandb and is_main_process():
-         wandb.finish()
+    if args.wandb and is_main_process():
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
