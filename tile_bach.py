@@ -1,13 +1,16 @@
+#!/usr/bin/env python3
 import argparse, csv, sys
 from pathlib import Path
 from PIL import Image
 
+# DN-friendly name pattern:
 # {row:03d}_{col:03d}_{y_anchor:04d}_{x_anchor:04d}_{parent}.png
 def save_tiles(img_path: Path, out_dir: Path, patch: int, stride: int,
                to_png: bool, manifest_writer, reset_manifest_cols=False):
     img = Image.open(img_path).convert("RGB")
-    W, H = img.size 
+    W, H = img.size  # PIL: (width, height)
 
+    # Safety: enforce multiples if you want. BACH is 2048x1536 so this should pass for patch=512.
     if (H - patch) % stride != 0 or (W - patch) % stride != 0:
         print(f"[WARN] {img_path.name}: size {W}x{H} not aligned to patch={patch}, stride={stride}. "
               f"Edges will be dropped.", file=sys.stderr)
@@ -16,9 +19,11 @@ def save_tiles(img_path: Path, out_dir: Path, patch: int, stride: int,
     rows = 1 + max(0, (H - patch) // stride)
     cols = 1 + max(0, (W - patch) // stride)
 
+    # Optional: keep per-parent subfolder (helps batch DN per image)
     parent_dir = out_dir / parent
     parent_dir.mkdir(parents=True, exist_ok=True)
 
+    # Write header if requested & not yet written
     if reset_manifest_cols and manifest_writer is not None:
         manifest_writer.writerow(["split","label","parent","row","col","y_anchor","x_anchor",
                                   "patch_h","patch_w","filename","src_path","width","height"])
@@ -29,18 +34,18 @@ def save_tiles(img_path: Path, out_dir: Path, patch: int, stride: int,
             y = r * stride
             x = c * stride
             if y + patch > H or x + patch > W:
-                continue  
-            crop = img.crop((x, y, x + patch, y + patch))
+                continue  # drop ragged edge (BACH shouldn't hit this)
+            crop = img.crop((x, y, x + patch, y + patch))  # (left, top, right, bottom)
 
             fname = f"{r:03d}_{c:03d}_{y:04d}_{x:04d}_{parent}.png" if to_png \
                     else f"{r:03d}_{c:03d}_{y:04d}_{x:04d}_{parent}{img_path.suffix.lower()}"
             out_path = parent_dir / fname
-            crop.save(out_path) 
+            crop.save(out_path)  # PNG by default is lossless
 
             if manifest_writer is not None:
                 manifest_writer.writerow([
-                    out_dir.parent.name,    
-                    out_dir.parent.parent.name if out_dir.parent.parent != out_dir.parent else "", 
+                    out_dir.parent.name,     # split (train/test) if you keep that structure
+                    out_dir.parent.parent.name if out_dir.parent.parent != out_dir.parent else "",  # label (best-effort)
                     parent,
                     r, c, y, x, patch, patch,
                     str(out_path.relative_to(out_dir.parent.parent)) if out_dir.parent.parent in out_path.parents else str(out_path),
@@ -108,7 +113,7 @@ def main():
                                  writer, reset_manifest_cols=reset_header)
                 reset_header = False
                 total += cnt
-            print(f"{label_dir}: wrote {total} patches so far.")
+            print(f"[OK] {label_dir}: wrote {total} patches so far.")
 
     if manifest_fp:
         manifest_fp.close()

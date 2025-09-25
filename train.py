@@ -12,11 +12,11 @@ import time
 from torch import nn
 from tqdm import tqdm
 import torchvision.models
-
+import random
+import cv2 
 
 from norm import ReinhardNormalizerTransform, MacenkoNormalizerTransform
 import numpy as np
-from util import thresh_cal, _tissue_mask
 from PIL import Image
 
 import torchvision.transforms as transforms
@@ -61,23 +61,23 @@ class OtsuTissueMask:
         self.min_tissue_ratio = min_tissue_ratio
 
     def __call__(self, img: Image.Image) -> Image.Image:
-        img_rgb = np.asarray(img.convert('RGB'))
-        img_hsv = np.asarray(img.convert('HSV'))
+        img_rgb = np.array(img.convert("RGB"))
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
-        thrR, thrG, thrB, thrH = thresh_cal(img_rgb, img_hsv)
-        mask = _tissue_mask(img_rgb, img_hsv, thrR, thrG, thrB, thrH)  # True = tissue
+        thr, mask = cv2.threshold(gray, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        tissue_mask = mask == 0
 
-        # Bail out if almost no tissue is detected
-        if mask.mean() < self.min_tissue_ratio:
+        if tissue_mask.mean() < self.min_tissue_ratio:
+            # fallback: just return original
             return img
 
-        if self.mode == 'mask':
+        if self.mode == "mask":
             out = img_rgb.copy()
-            out[~mask] = self.fill  # make background white
+            out[~tissue_mask] = self.fill
             return Image.fromarray(out)
 
-        # mode == 'crop'
-        ys, xs = np.where(mask)
+        ys, xs = np.where(tissue_mask)
         y0, y1 = ys.min(), ys.max()
         x0, x1 = xs.min(), xs.max()
         cropped = img_rgb[y0:y1+1, x0:x1+1]
@@ -87,12 +87,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train CRC Model")
     parser.add_argument('--resume', type=str, default=False, nargs = '?', const = True,
                         help='Path to a checkpoint to resume from. If not set, will use latest in ./checkpoints')
-    parser.add_argument('--epoch', type=int, default=30, nargs = '?', const = True,
+    parser.add_argument('--epoch', type=int, default=100, nargs = '?', const = True,
                         help='Number of epochs to train')
     parser.add_argument('--epoch_checkpoint', type=int, default=30, nargs = '?', const = True,
                         help='Number of epochs per checkpoint')
     parser.add_argument('--dataroot', type=str, default="train_png", nargs = '?', const = True,
                     help='Path to a checkpoint to resume from. If not set, will use latest in ./checkpoints')
+    parser.add_argument('--testroot', type = str, default = "test_png", nargs ='?', const = True,
+                        help = 'Path of the test directory')
     parser.add_argument('--batch_size', type=int, default=256, nargs = '?', const = True,
                         help='Batch Size')
     parser.add_argument('--num_workers', type=int, default=4, nargs = '?', const = True,
@@ -112,29 +114,14 @@ def parse_args():
                     help='wandb project name')
     return parser.parse_args()
 
-# Set up Reinhard normalisation
-# target_image = Image.open('../datasets/train_png/BACK/BACK-HKCDQKHD.png').convert("RGB")
-target_image = Image.open('../datasets/train_png/STR/STR-MPRKVSPT.png').convert("RGB")
-args = parse_args()
-
-# Normalisation read
-match args.norm:
-    case "reinhard":
-        norm_transform = ReinhardNormalizerTransform(target_image)
-
-    case "macenko":
-        norm_transform = MacenkoNormalizerTransform(target_image)
-
-if args.otsu == 'none':
-    preproc = []
-else:
-    preproc = [OtsuTissueMask(mode=args.otsu, fill=255)]
-
 def pil_loader_tif(path):
     # Ensure all images are converted to RGB
     with open(path, 'rb') as f:
         img = Image.open(f)
-        return img.convert('RGB')
+        img = img.convert('RGB')
+        setattr(img, "filename", str(path))
+        return img
+
 
 def get_latest_checkpoint(checkpoint_dir='checkpoints'):
     if not os.path.exists(checkpoint_dir):
@@ -145,21 +132,49 @@ def get_latest_checkpoint(checkpoint_dir='checkpoints'):
     latest = max(checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
     return os.path.join(checkpoint_dir, latest)
 
+def select_random_image(root: str):
+    '''Selects a random image at root'''
+    dirs = os.listdir(root)
+    cls_num = random.randint(0, len(dirs)-1)
+    cls_name = str(os.listdir(root)[cls_num])
+    cls_dir = root + '/' + cls_name
+    img_path = cls_dir + '/' + os.listdir(cls_dir)[random.randint(0, len(cls_dir)-1)]
+    print("Random Template Image found at: " + img_path)
+    return img_path
 
 def main(val_ratio = 0.2):
     '''epoch_checkpoint: Int that determines how many checkpoints of models are made between saves'''
     # Compute split sizes
     args = parse_args()
+    # Set up Template for colour normalisation
+    target_image = Image.open(select_random_image(f'../datasets/{args.dataroot}')).convert('RGB')
+    target_image = Image.open('../datasets/train_png/STR/STR-MPRKVSPT_p000.png').convert("RGB") 
+
+    # Normalisation read
+    match args.norm:
+        case "reinhard":
+            norm_transform = ReinhardNormalizerTransform(target_image)
+
+        case "macenko":
+            norm_transform = MacenkoNormalizerTransform(target_image)
+
+    if args.otsu == 'none':
+        preproc = []
+    else:
+        preproc = [OtsuTissueMask(mode=args.otsu, fill=255)]
+
     if args.pretrained:
         IMNET_MEAN = (0.485, 0.456, 0.406)
         IMNET_STD  = (0.229, 0.224, 0.225)
 
     else:
         IMNET_MEAN = IMNET_STD = None
+
+    resize_size = 224 if args.dataroot == "train_png" else 512
     if args.norm != 'no_norm':
         train_transform = transforms.Compose(preproc+
             [
-                transforms.Resize(224),
+                transforms.Resize(resize_size),
                 norm_transform,
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
@@ -168,12 +183,16 @@ def main(val_ratio = 0.2):
             ]
             + ([transforms.Normalize(IMNET_MEAN, IMNET_STD)] if args.pretrained else [])
         )
-
+        test_transform = transforms.Compose([
+            transforms.Resize(resize_size),
+            norm_transform,
+            transforms.ToTensor(),
+        ] + ([transforms.Normalize(IMNET_MEAN, IMNET_STD)] if args.pretrained else []))
 
     else: 
         train_transform = transforms.Compose(preproc+
             [
-                transforms.Resize(224),
+                transforms.Resize(resize_size),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
                 transforms.ToTensor(),
@@ -181,10 +200,10 @@ def main(val_ratio = 0.2):
             ]
             + ([transforms.Normalize(IMNET_MEAN, IMNET_STD)] if args.pretrained else []))
 
-    test_transform = transforms.Compose([
-        transforms.Resize(224),
-        transforms.ToTensor(),
-    ] + ([transforms.Normalize(IMNET_MEAN, IMNET_STD)] if args.pretrained else []))
+        test_transform = transforms.Compose([
+            transforms.Resize(resize_size),
+            transforms.ToTensor(),
+        ] + ([transforms.Normalize(IMNET_MEAN, IMNET_STD)] if args.pretrained else []))
 
     if args.dist:
         dist.init_process_group(backend="nccl")
@@ -198,14 +217,11 @@ def main(val_ratio = 0.2):
     train_dir = f"../datasets/{args.dataroot}/"
     full_dataset = datasets.ImageFolder(train_dir, loader=pil_loader_tif, transform = train_transform)
     val_size = int(len(full_dataset) * val_ratio)
-    # Split dataset
     train_subset = full_dataset
-    # Experiment: Use train images as training, val is test
-    test_dir = f"../datasets/test_png/"
+    test_dir = f"../datasets/{args.testroot}"
     test_set = datasets.ImageFolder(test_dir, loader = pil_loader_tif, transform = test_transform)
 
     train_sampler = DistributedSampler(train_subset, shuffle=True) if args.dist else None
-    # val_sampler   = DistributedSampler(val_subset,   shuffle=False) if args.dist else None
     test_sampler = DistributedSampler(test_set, shuffle = False) if args.dist else None
 
     trainloader = DataLoader(dataset = train_subset,
@@ -421,12 +437,13 @@ def main(val_ratio = 0.2):
                     'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                     'loss': train_loss_sync,
                 }
-                torch.save(checkpoint, f'checkpoints/{args.dataroot}_e{epoch+1}_{args.norm}_{("pt" if args.pretrained else "")}.pth')
+                torch.save(checkpoint, f'checkpoints/{args.dataroot}_best_{args.norm}_{("pt" if args.pretrained else "")}.pth')
             else:
                 bad_epochs += 1
+                torch.save(checkpoint, f'checkpoints/{args.dataroot}_e{epoch+1}_{args.norm}_{("pt" if args.pretrained else "")}.pth')   
                 if bad_epochs >= patience:
                     print("Early stopping.")
-                    stop_flag[:] = 1  # tell everyone to stop
+                    stop_flag[:] = 1  # tell everyone to stop                
 
         # make all ranks see the decision
         if is_dist():
