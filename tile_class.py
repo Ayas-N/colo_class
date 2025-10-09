@@ -4,7 +4,18 @@ import argparse, csv, sys
 from pathlib import Path
 from PIL import Image
 
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"} 
+KNOWN_TEST  = {"test", "testing", "testing_folder", "test_folder"}
+KNOWN_TRAIN = {"train", "training", "train_folder"}
+
+def collect_image_names(root: Path) -> set[str]:
+    """All image filenames (with extension) under root, lowercased."""
+    names = set()
+    if root and root.exists():
+        for p in root.rglob("*"):
+            if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                names.add(p.name.lower())
+    return names
 
 def is_image(p: Path) -> bool:
     return p.suffix.lower() in IMG_EXTS
@@ -67,10 +78,12 @@ def main():
     in_root  = Path(args.in_root).resolve()
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
-
-
     split_dirs = [d for d in in_root.iterdir() if d.is_dir() and d.name.lower() in
                   {"train_folder", "testing_folder", "val", "validation"}]
+    test_dir = next((d for d in split_dirs if d.name.lower() in KNOWN_TEST), None)
+    test_names = collect_image_names(test_dir) if test_dir else set()
+    if test_names:
+        print(f"[DE-DUP] Loaded {len(test_names)} filenames from test split: {test_dir}")
     print(split_dirs)
     if not split_dirs:
         split_dirs = [in_root]
@@ -104,6 +117,12 @@ def main():
                 continue
 
             for img_path in imgs:
+                if split_name.lower() in KNOWN_TRAIN and test_names:
+                    before = len(imgs)
+                    imgs = [p for p in imgs if p.name.lower() not in test_names]
+                    skipped = before - len(imgs)
+                    if skipped:
+                        print(f"[SKIP-DUP] {skipped} file(s) in {class_dir} also exist in testing; skipping.")
                 total += save_tiles(img_path, out_dir, args.patch, args.stride, args.to_png,
                                     writer=writer, split=split_name, label=label_name)
             print(f"[OK] {class_dir}: cumulative tiles = {total}")

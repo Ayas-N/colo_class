@@ -5,7 +5,6 @@ import argparse
 import torch
 import torch.optim as optim
 import time
-from util import thresh_cal, _tissue_mask
 from torch import nn
 from tqdm import tqdm
 

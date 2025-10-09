@@ -75,13 +75,17 @@ class OtsuTissueMask:
         if self.mode == "mask":
             out = img_rgb.copy()
             out[~tissue_mask] = self.fill
-            return Image.fromarray(out)
+            img_out = Image.fromarray(out)
+            setattr(img_out, "filename", img.filename)
+            return img_out
 
         ys, xs = np.where(tissue_mask)
         y0, y1 = ys.min(), ys.max()
         x0, x1 = xs.min(), xs.max()
         cropped = img_rgb[y0:y1+1, x0:x1+1]
-        return Image.fromarray(cropped)
+        img_out = Image.fromarray(cropped)
+        setattr(img_out, "filename", img.filename)
+        return img_out
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CRC Model")

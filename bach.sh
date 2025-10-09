@@ -1,0 +1,1 @@
+python train.py --dataroot bach_cycle --testroot test_bach --wandb --wandb_project bach-cycle --gpu_id 1 
