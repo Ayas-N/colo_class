@@ -1,1 +1,1 @@
-python train.py --dataroot bach_cycle --testroot test_bach --wandb --wandb_project bach-cycle --gpu_id 1 
+python train.py --dataroot train_folder --testroot test_bach --norm macenko --wandb --wandb_project bach-cycle --otsu mask --gpu_id 1

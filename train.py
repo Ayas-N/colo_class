@@ -15,13 +15,14 @@ import torchvision.models
 import random
 import cv2 
 
+from pathlib import Path
 from norm import ReinhardNormalizerTransform, MacenkoNormalizerTransform
 import numpy as np
 from PIL import Image
 
 import torchvision.transforms as transforms
 from torchvision import datasets
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset
 import wandb
 
 torch.backends.cuda.matmul.allow_tf32 = True  # TF32 on Ampere
@@ -54,7 +55,7 @@ class OtsuTissueMask:
     mode='mask' -> set background to white (255)
     mode='crop' -> crop image to the bounding box of the tissue mask
     """
-    def __init__(self, mode='mask', fill=255, min_tissue_ratio=0.01):
+    def __init__(self, mode='mask', fill=255, min_tissue_ratio=0.1):
         assert mode in ('mask', 'crop')
         self.mode = mode
         self.fill = fill
@@ -66,7 +67,12 @@ class OtsuTissueMask:
 
         thr, mask = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        tissue_mask = mask == 0
+        thr, mi = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # choose the mask that produces a tissue area in a sane range (e.g., 5%–95%)
+        tb = (mask == 0)  # tissue if black under BINARY
+        ti = (mi == 255)  # tissue if white under BINARY_INV
+        def ok(r): return 0.05 <= r <= 0.95
+        tissue_mask = ti if ok(ti.mean()) else (tb if ok(tb.mean()) else (ti if ti.mean()>tb.mean() else tb))
 
         if tissue_mask.mean() < self.min_tissue_ratio:
             # fallback: just return original
@@ -86,6 +92,72 @@ class OtsuTissueMask:
         img_out = Image.fromarray(cropped)
         setattr(img_out, "filename", img.filename)
         return img_out
+
+def compute_tissue_ratio(img_path) -> float:
+    """
+    Return fraction of pixels that look like tissue using simple Otsu threshold.
+    Background is assumed bright; pixels <= thresh are 'tissue'.
+    """
+    img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Failed to read image: {img_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Otsu thresholding: background bright -> 255, tissue darker -> 0
+    _, mask = cv2.threshold(
+        gray, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+    tissue_mask = (mask == 0)
+    return float(tissue_mask.mean())
+
+def filter_images(
+    input_dir,
+    output_dir,
+    min_tissue_ratio: float = 0.05,
+    move_background: bool = True,
+):
+    """
+    Create an Otsu-filtered copy of dataset:
+      - Keeps images with tissue_ratio >= min_tissue_ratio
+      - Optionally copies background-only images into _background/ for inspection
+    """
+    input_dir = input_dir.resolve()
+    output_dir = output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    kept = 0
+    removed = 0
+
+    for img_path in input_dir.rglob("*"):
+        if not img_path.is_file():
+            continue
+        if img_path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+            continue
+
+        try:
+            ratio = compute_tissue_ratio(img_path)
+        except Exception as e:
+            print(f"[WARN] Skipping {img_path}: {e}")
+            continue
+
+        rel = img_path.relative_to(input_dir)
+
+        if ratio >= min_tissue_ratio:
+            out_path = output_dir / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(img_path.read_bytes())
+            kept += 1
+        else:
+            removed += 1
+            if move_background:
+                bg_dir = output_dir / "_background"
+                out_path = bg_dir / rel
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_bytes(img_path.read_bytes())
+
+    print(f"[Otsu filter] Kept {kept} images, filtered out {removed} background images.")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train CRC Model")
@@ -116,6 +188,10 @@ def parse_args():
                     help='Enable Weights & Biases logging (rank0 only in DDP)')
     parser.add_argument('--wandb_project', type=str, default='crc-class',
                     help='wandb project name')
+    parser.add_argument('--otsu_filter_dataset', action='store_true',
+                    help="Run Otsu filtering on training set (create filtered copy) and train on that.")
+    parser.add_argument('--otsu_min_tissue_ratio', type=float, default=0.05,
+                    help="Min fraction of pixels considered tissue to keep an image when using --otsu_filter_dataset.")
     return parser.parse_args()
 
 def pil_loader_tif(path):
@@ -151,8 +227,9 @@ def main(val_ratio = 0.2):
     # Compute split sizes
     args = parse_args()
     # Set up Template for colour normalisation
-    target_image = Image.open(select_random_image(f'../datasets/{args.dataroot}')).convert('RGB')
-    target_image = Image.open('../datasets/train_png/STR/STR-MPRKVSPT_p000.png').convert("RGB") 
+    random_im = Image.open(select_random_image(f'../datasets/{args.dataroot}'))
+    is_bach = random_im.size[0] == 512
+    target_image = Image.open('../datasets/train_png/STR/STR-MPRKVSPT_p000.png').convert("RGB") if is_bach else random_im 
 
     # Normalisation read
     match args.norm:
@@ -174,7 +251,8 @@ def main(val_ratio = 0.2):
     else:
         IMNET_MEAN = IMNET_STD = None
 
-    resize_size = 224 if args.dataroot == "train_png" else 512
+    resize_size = 512 if is_bach else 224
+    print(f"Is this BACH? {is_bach}")
     if args.norm != 'no_norm':
         train_transform = transforms.Compose(preproc+
             [
@@ -218,12 +296,28 @@ def main(val_ratio = 0.2):
         device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
         local_rank = 0
 
-    train_dir = f"../datasets/{args.dataroot}/"
+    raw_train_dir = Path(f"../datasets/{args.dataroot}")
+    if args.otsu_filter_dataset:
+        filtered_dir = Path(f"../datasets/{args.dataroot}_otsu")
+        print(f"[Otsu filter] Creating filtered training set at: {filtered_dir}")
+        filter_images(
+            raw_train_dir,
+            filtered_dir,
+            min_tissue_ratio=args.otsu_min_tissue_ratio,
+            move_background=True,
+        )
+        train_dir = str(filtered_dir) + "/"
+    else:
+        train_dir = str(raw_train_dir) + "/"
+
     full_dataset = datasets.ImageFolder(train_dir, loader=pil_loader_tif, transform = train_transform)
-    val_size = int(len(full_dataset) * val_ratio)
     train_subset = full_dataset
     test_dir = f"../datasets/{args.testroot}"
     test_set = datasets.ImageFolder(test_dir, loader = pil_loader_tif, transform = test_transform)
+    # subset_size = 1000
+    # idx = np.random.choice(len(full_dataset), subset_size, replace=False) 
+    # idx = list(range(500))
+    # train_subset = Subset(full_dataset, idx)
 
     train_sampler = DistributedSampler(train_subset, shuffle=True) if args.dist else None
     test_sampler = DistributedSampler(test_set, shuffle = False) if args.dist else None
@@ -295,11 +389,11 @@ def main(val_ratio = 0.2):
     # If model may be wrapped by DDP later, pass the underlying module if wrapped.
     # Watch ONLY when a run exists
     _model_for_watch = model.module if hasattr(model, "module") else model
-    wandb.watch(_model_for_watch, log="gradients", log_freq=100)
-    try:
-        wandb.watch(_model_for_watch, log="gradients", log_freq=100)  # optional; can be "all" or "parameters"
-    except Exception:
-        pass  # safe if disabled or not desired
+    if args.wandb:
+        try:
+            wandb.watch(_model_for_watch, log="gradients", log_freq=100)  # optional; can be "all" or "parameters"
+        except Exception:
+            pass  # safe if disabled or not desired
     num_epochs = args.epoch
     start_epoch = 0
     if args.resume == True:
@@ -325,6 +419,7 @@ def main(val_ratio = 0.2):
             os.mkdir("./checkpoints")
 
     best_val = float('inf')
+    best_val_acc = 0.0  
     patience = 8
     bad_epochs = 0
 
@@ -430,7 +525,9 @@ def main(val_ratio = 0.2):
 
         if is_main_process():
             if val_loss_sync + 1e-6 < best_val:
+                # Update like this since LStainNorm uses epoch with best val loss
                 best_val = val_loss_sync
+                best_acc = val_acc_sync
                 bad_epochs = 0
 
                 os.makedirs("checkpoints", exist_ok=True)
@@ -441,6 +538,7 @@ def main(val_ratio = 0.2):
                     'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
                     'loss': train_loss_sync,
                 }
+                path = 'checkpoints/{args.dataroot}_best_{args.norm}_{("pt" if args.pretrained else "")}.pth' 
                 torch.save(checkpoint, f'checkpoints/{args.dataroot}_best_{args.norm}_{("pt" if args.pretrained else "")}.pth')
             else:
                 bad_epochs += 1
@@ -457,7 +555,17 @@ def main(val_ratio = 0.2):
             if is_dist(): dist.barrier()
             break
             
-    if args.wandb and is_main_process():
+    if is_main_process():
+        out_csv = "best_results.csv"  # single file, overwritten every run
+        write_header = (not os.path.exists(out_csv)) or (os.path.getsize(out_csv) == 0)
+        os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+
+        with open(out_csv, "a", newline="") as f:
+            wr = csv.writer(f)
+            if write_header:
+             wr.writerow(["dataroot", "best_val_acc"])
+            wr.writerow([args.dataroot, f"{best_acc:.4f}"])
+        print(f"[best] {args.dataroot}: best_val_acc={best_acc:.4f} → {out_csv}")
         wandb.finish()
 
 if __name__ == "__main__":

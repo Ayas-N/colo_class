@@ -1,0 +1,1 @@
+python train.py --dataroot lstainbach_cycle --testroot lstain_bach_test --wandb --wandb_project bach-cycle 
